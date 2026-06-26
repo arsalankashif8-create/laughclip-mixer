@@ -5,9 +5,10 @@ const fs       = require('fs');
 const path     = require('path');
 const os       = require('os');
 const { v4: uuidv4 } = require('uuid');
+const crypto   = require('crypto');
 
-const app  = express();
-app.use(express.json());
+const app = express();
+app.use(express.json({ limit: '10mb' }));
 
 // CORS
 app.use((req, res, next) => {
@@ -25,18 +26,11 @@ const R2_BUCKET     = 'laugh';
 const R2_ENDPOINT   = `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
 const CDN_BASE      = 'https://cdn.laughclip.online';
 
-// ── AWS Signature V4 for R2 ────────────────────────────────────────────────
-const crypto = require('crypto');
-
-function sign(key, msg) {
-  return crypto.createHmac('sha256', key).update(msg).digest();
-}
-
-function getSignatureKey(key, dateStamp, region, service) {
-  const kDate    = sign('AWS4' + key, dateStamp);
-  const kRegion  = sign(kDate, region);
-  const kService = sign(kRegion, service);
-  return sign(kService, 'aws4_request');
+// AWS Signature V4
+function sign(key, msg, binary = false) {
+  const hmac = crypto.createHmac('sha256', key);
+  hmac.update(msg);
+  return binary ? hmac.digest() : hmac.digest('hex');
 }
 
 async function uploadToR2(filePath, r2Key, contentType = 'video/mp4') {
@@ -47,59 +41,68 @@ async function uploadToR2(filePath, r2Key, contentType = 'video/mp4') {
   const fileBytes = fs.readFileSync(filePath);
   const payHash   = crypto.createHash('sha256').update(fileBytes).digest('hex');
 
-  const headers = {
+  const hdrs = {
     'content-type':         contentType,
     'host':                 host,
     'x-amz-content-sha256': payHash,
     'x-amz-date':           amzDate,
   };
 
-  const sortedKeys  = Object.keys(headers).sort();
-  const canonHdrs   = sortedKeys.map(k => `${k}:${headers[k]}`).join('\n') + '\n';
-  const signedHdrs  = sortedKeys.join(';');
-
-  const canonReq = [
-    'PUT', `/${R2_BUCKET}/${r2Key}`, '',
-    canonHdrs, signedHdrs, payHash
-  ].join('\n');
-
+  const keys      = Object.keys(hdrs).sort();
+  const canonHdrs = keys.map(k => `${k}:${hdrs[k]}`).join('\n') + '\n';
+  const signedH   = keys.join(';');
   const credScope = `${dateStamp}/auto/s3/aws4_request`;
+
+  const canonReq  = ['PUT', `/${R2_BUCKET}/${r2Key}`, '', canonHdrs, signedH, payHash].join('\n');
   const strToSign = ['AWS4-HMAC-SHA256', amzDate, credScope,
     crypto.createHash('sha256').update(canonReq).digest('hex')].join('\n');
 
-  const sigKey  = getSignatureKey(R2_SECRET_KEY, dateStamp, 'auto', 's3');
-  const sig     = crypto.createHmac('sha256', sigKey).update(strToSign).digest('hex');
-  const authHdr = `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${credScope}, SignedHeaders=${signedHdrs}, Signature=${sig}`;
+  const kDate    = sign(Buffer.from('AWS4' + R2_SECRET_KEY), dateStamp, true);
+  const kRegion  = sign(kDate, 'auto', true);
+  const kService = sign(kRegion, 's3', true);
+  const kSigning = sign(kService, 'aws4_request', true);
+  const sig      = sign(kSigning, strToSign);
+
+  const auth = `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${credScope}, SignedHeaders=${signedH}, Signature=${sig}`;
 
   const resp = await fetch(`${R2_ENDPOINT}/${R2_BUCKET}/${r2Key}`, {
     method: 'PUT',
     body:   fileBytes,
     headers: {
-      'Authorization':        authHdr,
-      'Content-Type':         contentType,
-      'Host':                 host,
-      'x-amz-content-sha256': payHash,
-      'x-amz-date':           amzDate,
-      'Content-Length':       fileBytes.length,
+      'Authorization': auth, 'Content-Type': contentType,
+      'Host': host, 'x-amz-content-sha256': payHash,
+      'x-amz-date': amzDate, 'Content-Length': String(fileBytes.length),
     }
   });
 
   if (resp.status !== 200 && resp.status !== 201) {
     const txt = await resp.text();
-    throw new Error(`R2 upload failed: ${resp.status} ${txt}`);
+    throw new Error(`R2 upload failed: ${resp.status} - ${txt}`);
   }
   return `${CDN_BASE}/${r2Key}`;
 }
 
-// ── Health ─────────────────────────────────────────────────────────────────
+// Download file from URL
+async function downloadFile(url, dest) {
+  const resp = await fetch(url, {
+    headers: { 'User-Agent': 'LaughClip-Mixer/1.0' },
+    timeout: 60000,
+  });
+  if (!resp.ok) throw new Error(`Download failed: ${resp.status} for ${url}`);
+  const buf = await resp.buffer();
+  fs.writeFileSync(dest, buf);
+  console.log(`Downloaded ${buf.length} bytes to ${dest}`);
+}
+
+// Health
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'laughclip-mixer' });
+  res.json({ status: 'ok', service: 'laughclip-mixer', time: new Date().toISOString() });
 });
 
-// ── POST /mix ──────────────────────────────────────────────────────────────
-// Body: { videoUrl, audioUrl, volume (0-1), outputKey }
+// POST /mix
 app.post('/mix', async (req, res) => {
-  const { videoUrl, audioUrl, volume = 0.8, outputKey } = req.body;
+  const { videoUrl, audioUrl, volume = 0.8 } = req.body;
+  console.log('[MIX] Request:', { videoUrl, audioUrl, volume });
 
   if (!videoUrl || !audioUrl) {
     return res.status(400).json({ error: 'Missing videoUrl or audioUrl' });
@@ -107,96 +110,90 @@ app.post('/mix', async (req, res) => {
 
   const tmpDir    = os.tmpdir();
   const id        = uuidv4();
-  const videoPath = path.join(tmpDir, `${id}_video.mp4`);
-  const audioPath = path.join(tmpDir, `${id}_audio.mp4`);
-  const outPath   = path.join(tmpDir, `${id}_mixed.mp4`);
+  const videoPath = path.join(tmpDir, `${id}_v.mp4`);
+  const audioPath = path.join(tmpDir, `${id}_a.mp4`);
+  const outPath   = path.join(tmpDir, `${id}_out.mp4`);
 
   try {
-    // Download video
-    console.log('Downloading video:', videoUrl);
-    const vResp = await fetch(videoUrl);
-    if (!vResp.ok) throw new Error('Cannot fetch video');
-    fs.writeFileSync(videoPath, Buffer.from(await vResp.arrayBuffer()));
+    console.log('[MIX] Downloading video...');
+    await downloadFile(videoUrl, videoPath);
 
-    // Download audio
-    console.log('Downloading audio:', audioUrl);
-    const aResp = await fetch(audioUrl);
-    if (!aResp.ok) throw new Error('Cannot fetch audio');
-    fs.writeFileSync(audioPath, Buffer.from(await aResp.arrayBuffer()));
+    console.log('[MIX] Downloading audio...');
+    await downloadFile(audioUrl, audioPath);
 
-    // Mix with FFmpeg
-    console.log('Mixing with FFmpeg...');
+    const vSize = fs.statSync(videoPath).size;
+    const aSize = fs.statSync(audioPath).size;
+    console.log(`[MIX] Video: ${vSize} bytes, Audio: ${aSize} bytes`);
+
+    console.log('[MIX] Running FFmpeg...');
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(videoPath)
         .input(audioPath)
         .complexFilter([
-          // Original video audio at 30% + sound at volume%
           `[0:a]volume=0.3[va]`,
-          `[1:a]volume=${volume}[sa]`,
+          `[1:a]volume=${volume},apad[sa]`,
           `[va][sa]amix=inputs=2:duration=first:dropout_transition=2[aout]`
         ])
         .outputOptions([
-          '-map', '0:v',       // video from input 0
-          '-map', '[aout]',    // mixed audio
-          '-c:v', 'copy',      // copy video (fast, no re-encode)
-          '-c:a', 'aac',       // encode audio
+          '-map', '0:v',
+          '-map', '[aout]',
+          '-c:v', 'copy',
+          '-c:a', 'aac',
           '-b:a', '128k',
           '-shortest',
           '-movflags', '+faststart',
         ])
         .output(outPath)
-        .on('start', cmd => console.log('FFmpeg:', cmd))
-        .on('end', resolve)
-        .on('error', reject)
+        .on('start', cmd => console.log('[FFmpeg]', cmd))
+        .on('stderr', line => console.log('[FFmpeg]', line))
+        .on('end', () => { console.log('[MIX] FFmpeg done'); resolve(); })
+        .on('error', (err) => { console.error('[MIX] FFmpeg error:', err); reject(err); })
         .run();
     });
 
-    // Upload mixed video to R2
-    const r2Key = outputKey || `mixed/${id}.mp4`;
-    console.log('Uploading to R2:', r2Key);
-    const mixedUrl = await uploadToR2(outPath, r2Key);
+    const outSize = fs.statSync(outPath).size;
+    console.log(`[MIX] Output: ${outSize} bytes`);
 
-    // Cleanup temp files
-    [videoPath, audioPath, outPath].forEach(f => {
-      try { fs.unlinkSync(f); } catch (_) {}
-    });
+    // Extract video key for output
+    const videoKey  = videoUrl.replace(CDN_BASE + '/', '');
+    const r2Key     = videoKey.replace(/\.mp4$/, `_mix_${id.slice(0,8)}.mp4`);
+    console.log('[MIX] Uploading to R2:', r2Key);
 
-    console.log('Mix done:', mixedUrl);
+    const mixedUrl  = await uploadToR2(outPath, r2Key);
+    console.log('[MIX] Done:', mixedUrl);
+
+    // Cleanup
+    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+
     return res.json({ status: 'success', mixedUrl });
 
   } catch (err) {
-    console.error('Mix error:', err.message);
-    // Cleanup
-    [videoPath, audioPath, outPath].forEach(f => {
-      try { fs.unlinkSync(f); } catch (_) {}
-    });
+    console.error('[MIX] Error:', err.message);
+    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ── POST /thumbnail ────────────────────────────────────────────────────────
-// Body: { videoUrl, outputKey }
+// POST /thumbnail
 app.post('/thumbnail', async (req, res) => {
-  const { videoUrl, outputKey } = req.body;
+  const { videoUrl } = req.body;
+  console.log('[THUMB] Request:', videoUrl);
+
   if (!videoUrl) return res.status(400).json({ error: 'Missing videoUrl' });
 
   const tmpDir    = os.tmpdir();
   const id        = uuidv4();
-  const videoPath = path.join(tmpDir, `${id}_video.mp4`);
+  const videoPath = path.join(tmpDir, `${id}_v.mp4`);
   const thumbPath = path.join(tmpDir, `${id}_thumb.jpg`);
 
   try {
-    // Download video
-    const vResp = await fetch(videoUrl);
-    if (!vResp.ok) throw new Error('Cannot fetch video');
-    fs.writeFileSync(videoPath, Buffer.from(await vResp.arrayBuffer()));
+    await downloadFile(videoUrl, videoPath);
 
-    // Extract first frame
     await new Promise((resolve, reject) => {
       ffmpeg(videoPath)
         .screenshots({
-          timestamps: ['00:00:00.500'],
+          timestamps: ['00:00:01'],
           filename:   path.basename(thumbPath),
           folder:     tmpDir,
           size:       '360x640',
@@ -205,24 +202,24 @@ app.post('/thumbnail', async (req, res) => {
         .on('error', reject);
     });
 
-    // Upload thumbnail to R2
-    const r2Key    = outputKey || `thumbnails/${id}_thumb.jpg`;
+    const videoKey = videoUrl.replace(CDN_BASE + '/', '');
+    const r2Key    = videoKey.replace(/\.mp4$/, '_thumb.jpg');
     const thumbUrl = await uploadToR2(thumbPath, r2Key, 'image/jpeg');
 
-    [videoPath, thumbPath].forEach(f => {
-      try { fs.unlinkSync(f); } catch (_) {}
-    });
+    [videoPath, thumbPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
 
+    console.log('[THUMB] Done:', thumbUrl);
     return res.json({ status: 'success', thumbUrl });
 
   } catch (err) {
-    console.error('Thumbnail error:', err.message);
-    [videoPath, thumbPath].forEach(f => {
-      try { fs.unlinkSync(f); } catch (_) {}
-    });
+    console.error('[THUMB] Error:', err.message);
+    [videoPath, thumbPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
     return res.status(500).json({ error: err.message });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`LaughClip Mixer running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`LaughClip Mixer running on port ${PORT}`);
+  console.log(`Health: http://localhost:${PORT}/health`);
+});

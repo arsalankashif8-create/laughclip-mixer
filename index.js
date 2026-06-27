@@ -218,6 +218,81 @@ app.post('/thumbnail', async (req, res) => {
   }
 });
 
+// ── POST /compress ────────────────────────────────────────────────────────
+// Compresses video for fast mobile feed playback
+// Body: { videoUrl, outputKey? }
+// Returns: { compressedUrl, originalSize, compressedSize }
+app.post('/compress', async (req, res) => {
+  const { videoUrl, outputKey } = req.body;
+  console.log('[COMPRESS] Request:', videoUrl);
+
+  if (!videoUrl) return res.status(400).json({ error: 'Missing videoUrl' });
+
+  const tmpDir     = os.tmpdir();
+  const id         = uuidv4();
+  const inputPath  = path.join(tmpDir, `${id}_input.mp4`);
+  const outputPath = path.join(tmpDir, `${id}_compressed.mp4`);
+
+  try {
+    // Download original video
+    console.log('[COMPRESS] Downloading...');
+    await downloadFile(videoUrl, inputPath);
+    const originalSize = fs.statSync(inputPath).size;
+    console.log(`[COMPRESS] Original: ${(originalSize/1024/1024).toFixed(2)} MB`);
+
+    // Compress with FFmpeg
+    // Settings: 720p max, H.264, CRF 28 (good quality/size balance)
+    // faststart: loads instantly, audio 96k (fine for short clips)
+    console.log('[COMPRESS] Running FFmpeg compression...');
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .videoCodec('libx264')
+        .audioCodec('aac')
+        .outputOptions([
+          '-vf', 'scale=720:-2',        // 720p width, auto height
+          '-crf', '28',                  // Quality (18=best, 28=good, 35=small)
+          '-preset', 'fast',             // Fast encoding
+          '-b:a', '96k',                 // Audio bitrate
+          '-movflags', '+faststart',     // Web optimized - loads immediately
+          '-pix_fmt', 'yuv420p',         // Max compatibility
+          '-profile:v', 'baseline',      // Works on all Android devices
+          '-level', '3.0',               // Android 4.0+ compatible
+        ])
+        .output(outputPath)
+        .on('start', cmd => console.log('[FFmpeg compress]', cmd))
+        .on('end', () => { console.log('[COMPRESS] Done'); resolve(); })
+        .on('error', err => { console.error('[COMPRESS] Error:', err); reject(err); })
+        .run();
+    });
+
+    const compressedSize = fs.statSync(outputPath).size;
+    const reduction = (((originalSize - compressedSize) / originalSize) * 100).toFixed(1);
+    console.log(`[COMPRESS] Result: ${(compressedSize/1024/1024).toFixed(2)} MB (${reduction}% smaller)`);
+
+    // Upload compressed video to R2
+    const videoKey     = videoUrl.replace(CDN_BASE + '/', '');
+    const r2Key        = outputKey || videoKey.replace(/\.mp4$/, '_hq.mp4');
+    const compressedUrl = await uploadToR2(outputPath, r2Key);
+
+    // Cleanup
+    [inputPath, outputPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+
+    console.log('[COMPRESS] Uploaded:', compressedUrl);
+    return res.json({
+      status: 'success',
+      compressedUrl,
+      originalSize,
+      compressedSize,
+      reduction: `${reduction}%`,
+    });
+
+  } catch (err) {
+    console.error('[COMPRESS] Error:', err.message);
+    [inputPath, outputPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`LaughClip Mixer running on port ${PORT}`);

@@ -82,6 +82,51 @@ async function uploadToR2(filePath, r2Key, contentType = 'video/mp4') {
   return `${CDN_BASE}/${r2Key}`;
 }
 
+// Delete file from R2
+async function deleteFromR2(r2Key) {
+  const now       = new Date();
+  const amzDate   = now.toISOString().replace(/[:\-]|\..../g, '').slice(0, 16) + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const host      = `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const payHash   = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; // empty
+
+  const hdrs = {
+    'host':                 host,
+    'x-amz-content-sha256': payHash,
+    'x-amz-date':           amzDate,
+  };
+
+  const keys      = Object.keys(hdrs).sort();
+  const canonHdrs = keys.map(k => `${k}:${hdrs[k]}`).join('\n') + '\n';
+  const signedH   = keys.join(';');
+  const credScope = `${dateStamp}/auto/s3/aws4_request`;
+
+  const canonReq  = ['DELETE', `/${R2_BUCKET}/${r2Key}`, '', canonHdrs, signedH, payHash].join('\n');
+  const strToSign = ['AWS4-HMAC-SHA256', amzDate, credScope,
+    crypto.createHash('sha256').update(canonReq).digest('hex')].join('\n');
+
+  const kDate    = sign(Buffer.from('AWS4' + R2_SECRET_KEY), dateStamp, true);
+  const kRegion  = sign(kDate, 'auto', true);
+  const kService = sign(kRegion, 's3', true);
+  const kSigning = sign(kService, 'aws4_request', true);
+  const sig      = sign(kSigning, strToSign);
+
+  const auth = `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${credScope}, SignedHeaders=${signedH}, Signature=${sig}`;
+
+  const resp = await fetch(`${R2_ENDPOINT}/${R2_BUCKET}/${r2Key}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': auth,
+      'Host': host,
+      'x-amz-content-sha256': payHash,
+      'x-amz-date': amzDate,
+    }
+  });
+
+  console.log(`[R2 DELETE] ${r2Key} → ${resp.status}`);
+  return resp.status === 204 || resp.status === 200;
+}
+
 // Download file from URL
 async function downloadFile(url, dest) {
   const resp = await fetch(url, {
@@ -274,8 +319,19 @@ app.post('/compress', async (req, res) => {
     const r2Key        = outputKey || videoKey.replace(/\.mp4$/, '_hq.mp4');
     const compressedUrl = await uploadToR2(outputPath, r2Key);
 
-    // Cleanup
+    // Cleanup temp files
     [inputPath, outputPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+
+    // Delete original from R2 to save storage space
+    const originalKey = videoUrl.replace(CDN_BASE + '/', '');
+    if (originalKey !== r2Key) { // Only delete if different from output
+      try {
+        await deleteFromR2(originalKey);
+        console.log('[COMPRESS] Original deleted from R2:', originalKey);
+      } catch (e) {
+        console.warn('[COMPRESS] Could not delete original:', e.message);
+      }
+    }
 
     console.log('[COMPRESS] Uploaded:', compressedUrl);
     return res.json({

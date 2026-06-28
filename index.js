@@ -294,14 +294,18 @@ app.post('/compress', async (req, res) => {
         .videoCodec('libx264')
         .audioCodec('aac')
         .outputOptions([
-          '-vf', 'scale=720:-2',        // 720p width, auto height
-          '-crf', '28',                  // Quality (18=best, 28=good, 35=small)
-          '-preset', 'fast',             // Fast encoding
-          '-b:a', '96k',                 // Audio bitrate
-          '-movflags', '+faststart',     // Web optimized - loads immediately
-          '-pix_fmt', 'yuv420p',         // Max compatibility
-          '-profile:v', 'baseline',      // Works on all Android devices
-          '-level', '3.0',               // Android 4.0+ compatible
+          '-vf', 'scale=720:-2',         // 720p — perfect for mobile
+          '-crf', '26',                  // Slightly better quality
+          '-preset', 'fast',             // Fast encode
+          '-b:v', '1500k',               // Max video bitrate
+          '-b:a', '128k',                // Audio bitrate
+          '-movflags', '+faststart',     // CRITICAL: header at front = instant play
+          '-pix_fmt', 'yuv420p',         // Max Android compatibility
+          '-profile:v', 'baseline',      // All Android devices
+          '-level', '3.1',               // Supports 720p
+          '-r', '30',                    // 30fps max
+          '-g', '60',                    // Keyframe every 2 seconds
+          '-sc_threshold', '0',          // Consistent keyframes
         ])
         .output(outputPath)
         .on('start', cmd => console.log('[FFmpeg compress]', cmd))

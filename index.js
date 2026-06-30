@@ -53,7 +53,7 @@ function sign(key, msg, binary = false) {
 
 async function uploadToR2(filePath, r2Key, contentType = 'video/mp4') {
   const now       = new Date();
-  const amzDate   = now.toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 16) + 'Z';
+  const amzDate   = now.toISOString().replace(/[:\-]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const dateStamp = amzDate.slice(0, 8);
   const host      = `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
   const fileBytes = fs.readFileSync(filePath);

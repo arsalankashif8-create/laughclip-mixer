@@ -6,6 +6,7 @@ const path     = require('path');
 const os       = require('os');
 const { v4: uuidv4 } = require('uuid');
 const crypto   = require('crypto');
+const admin    = require('firebase-admin');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -17,6 +18,24 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+// ── Firebase Admin init ─────────────────────────────────────────────────────
+let db = null;
+try {
+  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (saJson) {
+    const serviceAccount = JSON.parse(saJson);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    db = admin.firestore();
+    console.log('Firebase Admin initialized');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT not set — backfill endpoint disabled');
+  }
+} catch (e) {
+  console.error('Firebase Admin init failed:', e.message);
+}
 
 // R2 config
 const R2_ACCOUNT_ID = 'e8409ad0379b3627b71fdab04c341444';
@@ -82,52 +101,6 @@ async function uploadToR2(filePath, r2Key, contentType = 'video/mp4') {
   return `${CDN_BASE}/${r2Key}`;
 }
 
-// Delete file from R2
-async function deleteFromR2(r2Key) {
-  const now       = new Date();
-  const amzDate   = now.toISOString().replace(/[:\-]|\..../g, '').slice(0, 16) + 'Z';
-  const dateStamp = amzDate.slice(0, 8);
-  const host      = `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const payHash   = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; // empty
-
-  const hdrs = {
-    'host':                 host,
-    'x-amz-content-sha256': payHash,
-    'x-amz-date':           amzDate,
-  };
-
-  const keys      = Object.keys(hdrs).sort();
-  const canonHdrs = keys.map(k => `${k}:${hdrs[k]}`).join('\n') + '\n';
-  const signedH   = keys.join(';');
-  const credScope = `${dateStamp}/auto/s3/aws4_request`;
-
-  const canonReq  = ['DELETE', `/${R2_BUCKET}/${r2Key}`, '', canonHdrs, signedH, payHash].join('\n');
-  const strToSign = ['AWS4-HMAC-SHA256', amzDate, credScope,
-    crypto.createHash('sha256').update(canonReq).digest('hex')].join('\n');
-
-  const kDate    = sign(Buffer.from('AWS4' + R2_SECRET_KEY), dateStamp, true);
-  const kRegion  = sign(kDate, 'auto', true);
-  const kService = sign(kRegion, 's3', true);
-  const kSigning = sign(kService, 'aws4_request', true);
-  const sig      = sign(kSigning, strToSign);
-
-  const auth = `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${credScope}, SignedHeaders=${signedH}, Signature=${sig}`;
-
-  const resp = await fetch(`${R2_ENDPOINT}/${R2_BUCKET}/${r2Key}`, {
-    method: 'DELETE',
-    headers: {
-      'Authorization': auth,
-      'Host': host,
-      'x-amz-content-sha256': payHash,
-      'x-amz-date': amzDate,
-    }
-  });
-
-  console.log(`[R2 DELETE] ${r2Key} → ${resp.status}`);
-  return resp.status === 204 || resp.status === 200;
-}
-
-// Download file from URL
 async function downloadFile(url, dest) {
   const resp = await fetch(url, {
     headers: { 'User-Agent': 'LaughClip-Mixer/1.0' },
@@ -136,97 +109,9 @@ async function downloadFile(url, dest) {
   if (!resp.ok) throw new Error(`Download failed: ${resp.status} for ${url}`);
   const buf = await resp.buffer();
   fs.writeFileSync(dest, buf);
-  console.log(`Downloaded ${buf.length} bytes to ${dest}`);
 }
 
-// Health
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'laughclip-mixer', time: new Date().toISOString() });
-});
-
-// POST /mix
-app.post('/mix', async (req, res) => {
-  const { videoUrl, audioUrl, volume = 0.8 } = req.body;
-  console.log('[MIX] Request:', { videoUrl, audioUrl, volume });
-
-  if (!videoUrl || !audioUrl) {
-    return res.status(400).json({ error: 'Missing videoUrl or audioUrl' });
-  }
-
-  const tmpDir    = os.tmpdir();
-  const id        = uuidv4();
-  const videoPath = path.join(tmpDir, `${id}_v.mp4`);
-  const audioPath = path.join(tmpDir, `${id}_a.mp4`);
-  const outPath   = path.join(tmpDir, `${id}_out.mp4`);
-
-  try {
-    console.log('[MIX] Downloading video...');
-    await downloadFile(videoUrl, videoPath);
-
-    console.log('[MIX] Downloading audio...');
-    await downloadFile(audioUrl, audioPath);
-
-    const vSize = fs.statSync(videoPath).size;
-    const aSize = fs.statSync(audioPath).size;
-    console.log(`[MIX] Video: ${vSize} bytes, Audio: ${aSize} bytes`);
-
-    console.log('[MIX] Running FFmpeg...');
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(videoPath)
-        .input(audioPath)
-        .complexFilter([
-          `[0:a]volume=0.3[va]`,
-          `[1:a]volume=${volume},apad[sa]`,
-          `[va][sa]amix=inputs=2:duration=first:dropout_transition=2[aout]`
-        ])
-        .outputOptions([
-          '-map', '0:v',
-          '-map', '[aout]',
-          '-c:v', 'copy',
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-shortest',
-          '-movflags', '+faststart',
-        ])
-        .output(outPath)
-        .on('start', cmd => console.log('[FFmpeg]', cmd))
-        .on('stderr', line => console.log('[FFmpeg]', line))
-        .on('end', () => { console.log('[MIX] FFmpeg done'); resolve(); })
-        .on('error', (err) => { console.error('[MIX] FFmpeg error:', err); reject(err); })
-        .run();
-    });
-
-    const outSize = fs.statSync(outPath).size;
-    console.log(`[MIX] Output: ${outSize} bytes`);
-
-    // Extract video key for output
-    const videoKey  = videoUrl.replace(CDN_BASE + '/', '');
-    const r2Key     = videoKey.replace(/\.mp4$/, `_mix_${id.slice(0,8)}.mp4`);
-    console.log('[MIX] Uploading to R2:', r2Key);
-
-    const mixedUrl  = await uploadToR2(outPath, r2Key);
-    console.log('[MIX] Done:', mixedUrl);
-
-    // Cleanup
-    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
-
-    return res.json({ status: 'success', mixedUrl });
-
-  } catch (err) {
-    console.error('[MIX] Error:', err.message);
-    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /thumbnail
-app.post('/thumbnail', async (req, res) => {
-  const { videoUrl } = req.body;
-  console.log('[THUMB] Request:', videoUrl);
-
-  if (!videoUrl) return res.status(400).json({ error: 'Missing videoUrl' });
-
+async function generateThumbForVideo(videoUrl) {
   const tmpDir    = os.tmpdir();
   const id        = uuidv4();
   const videoPath = path.join(tmpDir, `${id}_v.mp4`);
@@ -252,21 +137,94 @@ app.post('/thumbnail', async (req, res) => {
     const thumbUrl = await uploadToR2(thumbPath, r2Key, 'image/jpeg');
 
     [videoPath, thumbPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+    return thumbUrl;
+  } catch (err) {
+    [videoPath, thumbPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+    throw err;
+  }
+}
 
-    console.log('[THUMB] Done:', thumbUrl);
-    return res.json({ status: 'success', thumbUrl });
+// Health
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'laughclip-mixer', firebaseReady: !!db, time: new Date().toISOString() });
+});
+
+// POST /mix
+app.post('/mix', async (req, res) => {
+  const { videoUrl, audioUrl, volume = 0.8 } = req.body;
+  console.log('[MIX] Request:', { videoUrl, audioUrl, volume });
+
+  if (!videoUrl || !audioUrl) {
+    return res.status(400).json({ error: 'Missing videoUrl or audioUrl' });
+  }
+
+  const tmpDir    = os.tmpdir();
+  const id        = uuidv4();
+  const videoPath = path.join(tmpDir, `${id}_v.mp4`);
+  const audioPath = path.join(tmpDir, `${id}_a.mp4`);
+  const outPath   = path.join(tmpDir, `${id}_out.mp4`);
+
+  try {
+    await downloadFile(videoUrl, videoPath);
+    await downloadFile(audioUrl, audioPath);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(videoPath)
+        .input(audioPath)
+        .complexFilter([
+          `[0:a]volume=0.3[va]`,
+          `[1:a]volume=${volume},apad[sa]`,
+          `[va][sa]amix=inputs=2:duration=first:dropout_transition=2[aout]`
+        ])
+        .outputOptions([
+          '-map', '0:v',
+          '-map', '[aout]',
+          '-c:v', 'copy',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-shortest',
+          '-movflags', '+faststart',
+        ])
+        .output(outPath)
+        .on('start', cmd => console.log('[FFmpeg]', cmd))
+        .on('end', () => { resolve(); })
+        .on('error', (err) => { reject(err); })
+        .run();
+    });
+
+    const videoKey  = videoUrl.replace(CDN_BASE + '/', '');
+    const r2Key     = videoKey.replace(/\.mp4$/, `_mix_${id.slice(0,8)}.mp4`);
+    const mixedUrl  = await uploadToR2(outPath, r2Key);
+
+    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+
+    return res.json({ status: 'success', mixedUrl });
 
   } catch (err) {
-    console.error('[THUMB] Error:', err.message);
-    [videoPath, thumbPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+    console.error('[MIX] Error:', err.message);
+    [videoPath, audioPath, outPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ── POST /compress ────────────────────────────────────────────────────────
-// Compresses video for fast mobile feed playback
-// Body: { videoUrl, outputKey? }
-// Returns: { compressedUrl, originalSize, compressedSize }
+// POST /thumbnail
+app.post('/thumbnail', async (req, res) => {
+  const { videoUrl } = req.body;
+  console.log('[THUMB] Request:', videoUrl);
+  if (!videoUrl) return res.status(400).json({ error: 'Missing videoUrl' });
+
+  try {
+    const thumbUrl = await generateThumbForVideo(videoUrl);
+    console.log('[THUMB] Done:', thumbUrl);
+    return res.json({ status: 'success', thumbUrl });
+  } catch (err) {
+    console.error('[THUMB] Error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /compress
 app.post('/compress', async (req, res) => {
   const { videoUrl, outputKey } = req.body;
   console.log('[COMPRESS] Request:', videoUrl);
@@ -279,76 +237,146 @@ app.post('/compress', async (req, res) => {
   const outputPath = path.join(tmpDir, `${id}_compressed.mp4`);
 
   try {
-    // Download original video
-    console.log('[COMPRESS] Downloading...');
     await downloadFile(videoUrl, inputPath);
     const originalSize = fs.statSync(inputPath).size;
-    console.log(`[COMPRESS] Original: ${(originalSize/1024/1024).toFixed(2)} MB`);
 
-    // Compress with FFmpeg
-    // Settings: 720p max, H.264, CRF 28 (good quality/size balance)
-    // faststart: loads instantly, audio 96k (fine for short clips)
-    console.log('[COMPRESS] Running FFmpeg compression...');
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
         .videoCodec('libx264')
         .audioCodec('aac')
         .outputOptions([
-          '-vf', 'scale=720:-2',         // 720p — perfect for mobile
-          '-crf', '26',                  // Slightly better quality
-          '-preset', 'fast',             // Fast encode
-          '-b:v', '1500k',               // Max video bitrate
-          '-b:a', '128k',                // Audio bitrate
-          '-movflags', '+faststart',     // CRITICAL: header at front = instant play
-          '-pix_fmt', 'yuv420p',         // Max Android compatibility
-          '-profile:v', 'baseline',      // All Android devices
-          '-level', '3.1',               // Supports 720p
-          '-r', '30',                    // 30fps max
-          '-g', '60',                    // Keyframe every 2 seconds
-          '-sc_threshold', '0',          // Consistent keyframes
+          '-vf', 'scale=720:-2',
+          '-crf', '26',
+          '-preset', 'fast',
+          '-b:v', '1500k',
+          '-b:a', '128k',
+          '-movflags', '+faststart',
+          '-pix_fmt', 'yuv420p',
+          '-profile:v', 'baseline',
+          '-level', '3.1',
+          '-r', '30',
+          '-g', '60',
+          '-sc_threshold', '0',
         ])
         .output(outputPath)
         .on('start', cmd => console.log('[FFmpeg compress]', cmd))
-        .on('end', () => { console.log('[COMPRESS] Done'); resolve(); })
-        .on('error', err => { console.error('[COMPRESS] Error:', err); reject(err); })
+        .on('end', () => { resolve(); })
+        .on('error', err => { reject(err); })
         .run();
     });
 
     const compressedSize = fs.statSync(outputPath).size;
     const reduction = (((originalSize - compressedSize) / originalSize) * 100).toFixed(1);
-    console.log(`[COMPRESS] Result: ${(compressedSize/1024/1024).toFixed(2)} MB (${reduction}% smaller)`);
 
-    // Upload compressed video to R2
-    const videoKey     = videoUrl.replace(CDN_BASE + '/', '');
-    const r2Key        = outputKey || videoKey.replace(/\.mp4$/, '_hq.mp4');
+    const videoKey  = videoUrl.replace(CDN_BASE + '/', '');
+    const r2Key     = outputKey || videoKey.replace(/\.mp4$/, '_hq.mp4');
     const compressedUrl = await uploadToR2(outputPath, r2Key);
 
-    // Cleanup temp files
     [inputPath, outputPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
 
     // Delete original from R2 to save storage space
-    const originalKey = videoUrl.replace(CDN_BASE + '/', '');
-    if (originalKey !== r2Key) { // Only delete if different from output
+    if (videoKey !== r2Key) {
       try {
-        await deleteFromR2(originalKey);
-        console.log('[COMPRESS] Original deleted from R2:', originalKey);
+        // reuse deleteFromR2 logic inline (simple HEAD/DELETE via same sig scheme)
+        await deleteFromR2(videoKey);
       } catch (e) {
         console.warn('[COMPRESS] Could not delete original:', e.message);
       }
     }
 
-    console.log('[COMPRESS] Uploaded:', compressedUrl);
     return res.json({
-      status: 'success',
-      compressedUrl,
-      originalSize,
-      compressedSize,
+      status: 'success', compressedUrl, originalSize, compressedSize,
       reduction: `${reduction}%`,
     });
 
   } catch (err) {
     console.error('[COMPRESS] Error:', err.message);
     [inputPath, outputPath].forEach(f => { try { fs.unlinkSync(f); } catch(_){} });
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+async function deleteFromR2(r2Key) {
+  const now       = new Date();
+  const amzDate   = now.toISOString().replace(/[:\-]|\.\d{3}/g, '').slice(0, 16) + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const host      = `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const payHash   = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+  const hdrs = { 'host': host, 'x-amz-content-sha256': payHash, 'x-amz-date': amzDate };
+  const keys      = Object.keys(hdrs).sort();
+  const canonHdrs = keys.map(k => `${k}:${hdrs[k]}`).join('\n') + '\n';
+  const signedH   = keys.join(';');
+  const credScope = `${dateStamp}/auto/s3/aws4_request`;
+  const canonReq  = ['DELETE', `/${R2_BUCKET}/${r2Key}`, '', canonHdrs, signedH, payHash].join('\n');
+  const strToSign = ['AWS4-HMAC-SHA256', amzDate, credScope,
+    crypto.createHash('sha256').update(canonReq).digest('hex')].join('\n');
+  const kDate    = sign(Buffer.from('AWS4' + R2_SECRET_KEY), dateStamp, true);
+  const kRegion  = sign(kDate, 'auto', true);
+  const kService = sign(kRegion, 's3', true);
+  const kSigning = sign(kService, 'aws4_request', true);
+  const sig      = sign(kSigning, strToSign);
+  const auth = `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY}/${credScope}, SignedHeaders=${signedH}, Signature=${sig}`;
+
+  const resp = await fetch(`${R2_ENDPOINT}/${R2_BUCKET}/${r2Key}`, {
+    method: 'DELETE',
+    headers: { 'Authorization': auth, 'Host': host, 'x-amz-content-sha256': payHash, 'x-amz-date': amzDate }
+  });
+  console.log(`[R2 DELETE] ${r2Key} -> ${resp.status}`);
+  return resp.status === 204 || resp.status === 200;
+}
+
+// ── POST /backfill-thumbnails ────────────────────────────────────────────
+// One-time job: scan ALL clips missing thumbnailUrl, generate + save them.
+// Call with ?limit=N to control batch size (default 20), ?dryRun=true to just count.
+app.post('/backfill-thumbnails', async (req, res) => {
+  if (!db) return res.status(500).json({ error: 'Firebase not initialized — set FIREBASE_SERVICE_ACCOUNT env var' });
+
+  const limit  = parseInt(req.query.limit || '20', 10);
+  const dryRun = req.query.dryRun === 'true';
+
+  try {
+    const snapshot = await db.collection('clips').get();
+    const missing = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      if ((!data.thumbnailUrl || data.thumbnailUrl === '') && data.url) {
+        missing.push({ id: doc.id, url: data.url });
+      }
+    });
+
+    console.log(`[BACKFILL] Found ${missing.length} clips missing thumbnails (total clips: ${snapshot.size})`);
+
+    if (dryRun) {
+      return res.json({ status: 'dry-run', totalClips: snapshot.size, missingThumbnails: missing.length });
+    }
+
+    const batch = missing.slice(0, limit);
+    const results = [];
+
+    for (const clip of batch) {
+      try {
+        const thumbUrl = await generateThumbForVideo(clip.url);
+        await db.collection('clips').doc(clip.id).update({ thumbnailUrl: thumbUrl });
+        results.push({ id: clip.id, status: 'ok', thumbUrl });
+        console.log(`[BACKFILL] ✅ ${clip.id} -> ${thumbUrl}`);
+      } catch (e) {
+        results.push({ id: clip.id, status: 'failed', error: e.message });
+        console.error(`[BACKFILL] ❌ ${clip.id}: ${e.message}`);
+      }
+    }
+
+    return res.json({
+      status: 'done',
+      totalClips: snapshot.size,
+      totalMissing: missing.length,
+      processedThisRun: batch.length,
+      remaining: missing.length - batch.length,
+      results,
+    });
+
+  } catch (err) {
+    console.error('[BACKFILL] Fatal error:', err.message);
     return res.status(500).json({ error: err.message });
   }
 });
